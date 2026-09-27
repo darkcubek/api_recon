@@ -303,6 +303,7 @@ SUB_DIR="$OUTPUT_DIR/subdomains"
 FFUF_DIR="$OUTPUT_DIR/ffuf"
 CAND_DIR="$OUTPUT_DIR/candidates"
 SPECS_DIR="$OUTPUT_DIR/specs"
+BASELINE_DIR="$OUTPUT_DIR/baselines"
 LOG_DIR="$OUTPUT_DIR/logs"
 
 mkdir -p \
@@ -311,6 +312,7 @@ mkdir -p \
   "$FFUF_DIR" \
   "$CAND_DIR" \
   "$SPECS_DIR" \
+  "$BASELINE_DIR" \
   "$LOG_DIR"
 
 RUN_LOG="$LOG_DIR/run.log"
@@ -329,7 +331,10 @@ GAU_SUBDOMAINS="$SUB_DIR/gau_subdomains.txt"
 USER_SUBDOMAINS="$SUB_DIR/user_subdomains.txt"
 ALL_SUBDOMAINS="$SUB_DIR/all_subdomains.txt"
 LIVE_HOSTS_JSON="$SUB_DIR/live_hosts.jsonl"
+LIVE_HOSTS_PRE="$SUB_DIR/live_hosts_pre_placeholder_filter.txt"
 LIVE_HOSTS="$SUB_DIR/live_hosts.txt"
+PLACEHOLDER_SUBDOMAINS="$SUB_DIR/placeholder_subdomains.txt"
+WILDCARD_BASELINE="$BASELINE_DIR/wildcard_subdomain.tsv"
 
 HOSTS_FILE="$OUTPUT_DIR/hosts_in_scope.txt"
 
@@ -341,7 +346,9 @@ FFUF_HITS="$CAND_DIR/ffuf_hits.txt"
 ALL_CANDIDATES="$CAND_DIR/all_candidates.txt"
 HTTPX_JSON="$CAND_DIR/httpx_results.jsonl"
 
+ACTIVE_HITS_PRE="$CAND_DIR/active_hits_pre_soft404.txt"
 ACTIVE_HITS="$CAND_DIR/active_hits.txt"
+SOFT404_REJECTED="$CAND_DIR/soft404_rejected.txt"
 PRIORITY_HITS="$CAND_DIR/priority_hits.txt"
 AUTH_HITS="$CAND_DIR/auth_login_token.txt"
 API_DOC_HITS="$CAND_DIR/swagger_openapi_docs.txt"
@@ -424,29 +431,191 @@ log "3/8: Сбор URL через waybackurls..."
 
 : > "$WAYBACK_FILE"
 
-# waybackurls получает домен через stdin.
 if [[ "$DEBUG" -eq 1 ]]; then
   debug "waybackurls: домен $DOMAIN, timeout ${PASSIVE_TIMEOUT}s"
 fi
 
 set +e
 printf '%s\n' "$DOMAIN" |
-  timeout --preserve-status "${PASSIVE_TIMEOUT}s" "$WAYBACK_BIN" \
+  timeout "${PASSIVE_TIMEOUT}s" "$WAYBACK_BIN" \
   > "$WAYBACK_FILE" \
   2> "$LOG_DIR/waybackurls.stderr.log"
 WAYBACK_RC=$?
 set -e
 
-if [[ "$WAYBACK_RC" -ne 0 ]]; then
+if [[ "$WAYBACK_RC" -eq 124 || "$WAYBACK_RC" -eq 143 ]]; then
+  warn "waybackurls: превышен таймаут ${PASSIVE_TIMEOUT}s; продолжаю работу."
+elif [[ "$WAYBACK_RC" -ne 0 ]]; then
   warn "waybackurls завершился с кодом $WAYBACK_RC."
 fi
 
+# Если waybackurls ничего не вернул или был остановлен timeout,
+# пробуем напрямую Wayback CDX API.
 if [[ ! -s "$WAYBACK_FILE" ]]; then
-  warn "waybackurls вернул 0 URL."
-  if [[ -s "$LOG_DIR/waybackurls.stderr.log" ]]; then
-    tail -n 10 "$LOG_DIR/waybackurls.stderr.log" >&2 || true
+  warn "waybackurls вернул 0 URL. Пробую прямой Wayback CDX API..."
+
+  CDX_TMP="$HIST_DIR/wayback_cdx.tmp"
+
+  set +e
+  "$CURL_BIN" \
+    -fsSL \
+    --connect-timeout 10 \
+    --max-time 60 \
+    --get \
+    --data-urlencode "url=*.$DOMAIN/*" \
+    --data-urlencode "output=txt" \
+    --data-urlencode "fl=original" \
+    --data-urlencode "collapse=urlkey" \
+    "https://web.archive.org/cdx/search/cdx" \
+    > "$CDX_TMP" \
+    2> "$LOG_DIR/wayback_cdx.stderr.log"
+  CDX_RC=$?
+  set -e
+
+  if [[ "$CDX_RC" -eq 0 && -s "$CDX_TMP" ]]; then
+    grep -E '^https?://' "$CDX_TMP" | sort -u > "$WAYBACK_FILE" || true
+    log "Wayback CDX вернул $(wc -l < "$WAYBACK_FILE" | tr -d ' ') URL."
+  else
+    warn "Wayback CDX также не вернул URL."
   fi
+
+  rm -f "$CDX_TMP"
 fi
+
+if [[ -s "$WAYBACK_FILE" ]]; then
+  sort -u -o "$WAYBACK_FILE" "$WAYBACK_FILE"
+fi
+
+
+# Создаёт сигнатуру default-vhost / wildcard-заглушки на случайных
+# несуществующих субдоменах. Если два случайных имени возвращают один и тот же
+# ответ, этот ответ считаем baseline для "фальшивых" субдоменов.
+detect_wildcard_subdomain_baseline() {
+  local rnd1 rnd2 host1 host2
+  local scheme1 scheme2 mode1 mode2
+  local body1 body2 meta1 meta2
+  local code1 code2 size1 size2 hash1 hash2
+
+  rnd1="__recon_wild_${RANDOM}_${RANDOM}_a"
+  rnd2="__recon_wild_${RANDOM}_${RANDOM}_b"
+  host1="${rnd1}.${DOMAIN}"
+  host2="${rnd2}.${DOMAIN}"
+
+  : > "$WILDCARD_BASELINE"
+
+  # Сначала проверяем, разрешаются ли случайные имена вообще.
+  if ! getent ahosts "$host1" >/dev/null 2>&1; then
+    debug "Wildcard DNS не обнаружен: $host1 не разрешается."
+    return 1
+  fi
+
+  if ! getent ahosts "$host2" >/dev/null 2>&1; then
+    debug "Wildcard DNS не подтверждён вторым случайным именем."
+    return 1
+  fi
+
+  scheme1="$(choose_scheme "$host1")"
+  scheme2="$(choose_scheme "$host2")"
+
+  mode1="${scheme1##*|}"
+  mode2="${scheme2##*|}"
+  scheme1="${scheme1%%|*}"
+  scheme2="${scheme2%%|*}"
+
+  # Для baseline оба случайных имени должны вести по одной схеме.
+  [[ "$scheme1" == "$scheme2" ]] || {
+    debug "Wildcard baseline: схемы случайных хостов различаются."
+    return 1
+  }
+
+  local curl_tls1=()
+  local curl_tls2=()
+
+  [[ "$INSECURE" -eq 1 || "$mode1" == "insecure" ]] && curl_tls1=(-k)
+  [[ "$INSECURE" -eq 1 || "$mode2" == "insecure" ]] && curl_tls2=(-k)
+
+  body1="$BASELINE_DIR/wildcard_subdomain_1.body"
+  body2="$BASELINE_DIR/wildcard_subdomain_2.body"
+
+  meta1="$("$CURL_BIN" "${curl_tls1[@]}" -L -sS \
+    --connect-timeout 5 --max-time 12 \
+    -o "$body1" \
+    -w '%{http_code}\t%{size_download}' \
+    "$scheme1://$host1/" 2>> "$LOG_DIR/wildcard_subdomain.stderr.log" || true)"
+
+  meta2="$("$CURL_BIN" "${curl_tls2[@]}" -L -sS \
+    --connect-timeout 5 --max-time 12 \
+    -o "$body2" \
+    -w '%{http_code}\t%{size_download}' \
+    "$scheme2://$host2/" 2>> "$LOG_DIR/wildcard_subdomain.stderr.log" || true)"
+
+  code1="${meta1%%$'\t'*}"
+  size1="${meta1##*$'\t'}"
+  code2="${meta2%%$'\t'*}"
+  size2="${meta2##*$'\t'}"
+
+  [[ "$code1" =~ ^[0-9]{3}$ && "$code2" =~ ^[0-9]{3}$ ]] || return 1
+  [[ -s "$body1" && -s "$body2" ]] || return 1
+
+  hash1="$(sha256sum "$body1" | awk '{print $1}')"
+  hash2="$(sha256sum "$body2" | awk '{print $1}')"
+
+  if [[ "$code1" == "$code2" && "$size1" == "$size2" && "$hash1" == "$hash2" ]]; then
+    printf '%s\t%s\t%s\t%s\n' "$scheme1" "$code1" "$size1" "$hash1" > "$WILDCARD_BASELINE"
+    log "Wildcard/default-vhost обнаружен: случайные субдомены возвращают одинаковую страницу HTTP $code1, ${size1} B."
+    return 0
+  fi
+
+  debug "Случайные субдомены разрешаются, но одинаковой заглушки не обнаружено."
+  return 1
+}
+
+# Сравнивает корневую страницу найденного субдомена с wildcard/default-vhost baseline.
+is_placeholder_subdomain() {
+  local host="$1"
+
+  [[ -s "$WILDCARD_BASELINE" ]] || return 1
+
+  local expected_scheme expected_code expected_size expected_hash
+  IFS=$'\t' read -r expected_scheme expected_code expected_size expected_hash < "$WILDCARD_BASELINE"
+
+  local scheme_info scheme tls_mode
+  scheme_info="$(choose_scheme "$host")"
+  scheme="${scheme_info%%|*}"
+  tls_mode="${scheme_info##*|}"
+
+  local curl_tls=()
+  [[ "$INSECURE" -eq 1 || "$tls_mode" == "insecure" ]] && curl_tls=(-k)
+
+  local tmp_body meta code size hash
+  tmp_body="$BASELINE_DIR/subdomain_$(safe_filename "$host").body"
+
+  meta="$("$CURL_BIN" "${curl_tls[@]}" -L -sS \
+    --connect-timeout 5 --max-time 12 \
+    -o "$tmp_body" \
+    -w '%{http_code}\t%{size_download}' \
+    "$scheme://$host/" 2>> "$LOG_DIR/wildcard_subdomain.stderr.log" || true)"
+
+  code="${meta%%$'\t'*}"
+  size="${meta##*$'\t'}"
+
+  if [[ -s "$tmp_body" ]]; then
+    hash="$(sha256sum "$tmp_body" | awk '{print $1}')"
+  else
+    hash=""
+  fi
+
+  rm -f "$tmp_body"
+
+  if [[ "$scheme" == "$expected_scheme" &&
+        "$code" == "$expected_code" &&
+        "$size" == "$expected_size" &&
+        "$hash" == "$expected_hash" ]]; then
+    return 0
+  fi
+
+  return 1
+}
 
 ###############################################################################
 # SUBDOMAIN MERGE
@@ -504,7 +673,9 @@ cp "$ALL_SUBDOMAINS" "$HOSTS_FILE"
 log "Найдено уникальных хостов в области: $(wc -l < "$ALL_SUBDOMAINS" | tr -d ' ')"
 
 : > "$LIVE_HOSTS_JSON"
+: > "$LIVE_HOSTS_PRE"
 : > "$LIVE_HOSTS"
+: > "$PLACEHOLDER_SUBDOMAINS"
 
 if [[ -s "$ALL_SUBDOMAINS" ]]; then
   "$HTTPX_BIN" \
@@ -523,10 +694,40 @@ if [[ -s "$ALL_SUBDOMAINS" ]]; then
     | (.url // .input // empty)
   ' "$LIVE_HOSTS_JSON" 2>/dev/null |
     sed '/^[[:space:]]*$/d' |
-    sort -u > "$LIVE_HOSTS" || true
+    sort -u > "$LIVE_HOSTS_PRE" || true
+
+  # Проверяем wildcard/default-vhost только после того, как уже получили список
+  # отвечающих хостов.
+  detect_wildcard_subdomain_baseline || true
+
+  while IFS= read -r live_url; do
+    [[ -n "$live_url" ]] || continue
+
+    rest="${live_url#*://}"
+    host="${rest%%/*}"
+    host="${host%%:*}"
+
+    # Корневой домен никогда не выбрасываем как "placeholder subdomain".
+    if [[ "$host" == "$DOMAIN" ]]; then
+      printf '%s\n' "$live_url" >> "$LIVE_HOSTS"
+      continue
+    fi
+
+    if is_placeholder_subdomain "$host"; then
+      printf '%s\n' "$host" >> "$PLACEHOLDER_SUBDOMAINS"
+      debug "Исключён placeholder-субдомен: $host"
+    else
+      printf '%s\n' "$live_url" >> "$LIVE_HOSTS"
+    fi
+  done < "$LIVE_HOSTS_PRE"
+
+  sort -u -o "$LIVE_HOSTS" "$LIVE_HOSTS"
+  sort -u -o "$PLACEHOLDER_SUBDOMAINS" "$PLACEHOLDER_SUBDOMAINS"
 fi
 
-log "Живых web-хостов: $(wc -l < "$LIVE_HOSTS" | tr -d ' ')"
+log "Отвечающих web-хостов до фильтра заглушек: $(wc -l < "$LIVE_HOSTS_PRE" | tr -d ' ')"
+log "Исключено placeholder-субдоменов: $(wc -l < "$PLACEHOLDER_SUBDOMAINS" | tr -d ' ')"
+log "Реальных web-хостов после фильтра: $(wc -l < "$LIVE_HOSTS" | tr -d ' ')"
 
 ###############################################################################
 # HISTORICAL MERGE
@@ -588,6 +789,149 @@ choose_scheme() {
   printf 'https|unreachable'
 }
 
+
+# Проверяет, отдаёт ли сайт одинаковую "страницу не найдена" с успешным HTTP-кодом.
+# Высокоуверенный soft-404 определяется только если два случайных несуществующих
+# пути имеют одинаковый HTTP-код, размер и SHA-256 тела.
+detect_soft404_baseline() {
+  local host="$1"
+  local base_path="$2"
+  local label="$3"
+  local scheme="$4"
+  local tls_mode="$5"
+
+  local host_name token1 token2 url1 url2
+  local body1 body2 meta1 meta2
+  local code1 code2 size1 size2 hash1 hash2
+  local curl_tls=()
+
+  host_name="$(safe_filename "$host")"
+  token1="__recon_missing_${RANDOM}_${RANDOM}_a__"
+  token2="__recon_missing_${RANDOM}_${RANDOM}_b__"
+
+  url1="$scheme://$host$base_path/$token1"
+  url2="$scheme://$host$base_path/$token2"
+
+  body1="$BASELINE_DIR/${host_name}_${label}_1.body"
+  body2="$BASELINE_DIR/${host_name}_${label}_2.body"
+
+  if [[ "$INSECURE" -eq 1 || "$tls_mode" == "insecure" ]]; then
+    curl_tls=(-k)
+  fi
+
+  meta1="$("$CURL_BIN" "${curl_tls[@]}" -L -sS \
+    --connect-timeout 5 --max-time 12 \
+    -o "$body1" \
+    -w '%{http_code}\t%{size_download}' \
+    "$url1" 2>> "$LOG_DIR/soft404.stderr.log" || true)"
+
+  meta2="$("$CURL_BIN" "${curl_tls[@]}" -L -sS \
+    --connect-timeout 5 --max-time 12 \
+    -o "$body2" \
+    -w '%{http_code}\t%{size_download}' \
+    "$url2" 2>> "$LOG_DIR/soft404.stderr.log" || true)"
+
+  code1="${meta1%%$'\t'*}"
+  size1="${meta1##*$'\t'}"
+  code2="${meta2%%$'\t'*}"
+  size2="${meta2##*$'\t'}"
+
+  [[ "$code1" =~ ^[0-9]{3}$ ]] || return 1
+  [[ "$code2" =~ ^[0-9]{3}$ ]] || return 1
+  [[ -s "$body1" && -s "$body2" ]] || return 1
+
+  hash1="$(sha256sum "$body1" | awk '{print $1}')"
+  hash2="$(sha256sum "$body2" | awk '{print $1}')"
+
+  if [[ "$code1" == "$code2" && "$size1" == "$size2" && "$hash1" == "$hash2" ]]; then
+    printf '%s\t%s\t%s\n' "$code1" "$size1" "$hash1" \
+      > "$BASELINE_DIR/${host_name}_${label}.tsv"
+
+    log "soft-404: $host$base_path -> HTTP $code1, ${size1} B; одинаковая заглушка будет исключаться."
+    return 0
+  fi
+
+  rm -f "$BASELINE_DIR/${host_name}_${label}.tsv"
+  debug "soft-404: стабильная заглушка для $host$base_path не обнаружена."
+  return 1
+}
+
+# После httpx перепроверяет кандидаты против сохранённых soft-404 baseline.
+# Это дополнительно убирает исторические URL, которые могли вернуть ту же
+# custom-404 страницу с кодом 200.
+filter_soft404_hits() {
+  local input="$1"
+  local output="$2"
+  local rejected="$3"
+
+  : > "$output"
+  : > "$rejected"
+
+  while IFS= read -r url; do
+    [[ -n "$url" ]] || continue
+
+    local rest host path label host_name sigfile
+    local expected_code expected_size expected_hash
+    local tmp_body meta code size hash
+    local curl_tls=()
+
+    rest="${url#*://}"
+    host="${rest%%/*}"
+    host="${host%%:*}"
+    path="/${rest#*/}"
+    [[ "$rest" == "$host" ]] && path="/"
+
+    if [[ "$path" == /api/* || "$path" == "/api" ]]; then
+      label="api"
+    else
+      label="root"
+    fi
+
+    host_name="$(safe_filename "$host")"
+    sigfile="$BASELINE_DIR/${host_name}_${label}.tsv"
+
+    if [[ ! -s "$sigfile" ]]; then
+      printf '%s\n' "$url" >> "$output"
+      continue
+    fi
+
+    IFS=$'\t' read -r expected_code expected_size expected_hash < "$sigfile"
+
+    tmp_body="$BASELINE_DIR/check_$(printf '%s' "$url" | sha256sum | awk '{print substr($1,1,16)}').body"
+
+    if [[ "$INSECURE" -eq 1 ]]; then
+      curl_tls=(-k)
+    fi
+
+    meta="$("$CURL_BIN" "${curl_tls[@]}" -L -sS \
+      --connect-timeout 5 --max-time 12 \
+      -o "$tmp_body" \
+      -w '%{http_code}\t%{size_download}' \
+      "$url" 2>> "$LOG_DIR/soft404.stderr.log" || true)"
+
+    code="${meta%%$'\t'*}"
+    size="${meta##*$'\t'}"
+
+    if [[ -s "$tmp_body" ]]; then
+      hash="$(sha256sum "$tmp_body" | awk '{print $1}')"
+    else
+      hash=""
+    fi
+
+    rm -f "$tmp_body"
+
+    if [[ "$code" == "$expected_code" && "$size" == "$expected_size" && "$hash" == "$expected_hash" ]]; then
+      printf '%s\n' "$url" >> "$rejected"
+      debug "soft-404 исключён: $url"
+    else
+      printf '%s\n' "$url" >> "$output"
+    fi
+  done < "$input"
+
+  sort -u -o "$output" "$output"
+  sort -u -o "$rejected" "$rejected"
+}
+
 run_ffuf() {
   local host="$1"
   local base_path="$2"
@@ -597,11 +941,22 @@ run_ffuf() {
 
   local host_name
   local ffuf_tls=()
+  local soft404_filter=()
 
   host_name="$(safe_filename "$host")"
 
   if [[ "$INSECURE" -eq 1 || "$tls_mode" == "insecure" ]]; then
     ffuf_tls=(-k)
+  fi
+
+  if detect_soft404_baseline "$host" "$base_path" "$label" "$scheme" "$tls_mode"; then
+    local baseline_file baseline_code baseline_size baseline_hash
+    baseline_file="$BASELINE_DIR/${host_name}_${label}.tsv"
+    IFS=$'\t' read -r baseline_code baseline_size baseline_hash < "$baseline_file"
+
+    # Фильтруем по размеру, а не по HTTP-коду: настоящий endpoint тоже может
+    # возвращать 200, поэтому -fc 200 дал бы ложные отрицания.
+    soft404_filter=(-fs "$baseline_size")
   fi
 
   log "ffuf: $scheme://$host$base_path/FUZZ"
@@ -611,6 +966,7 @@ run_ffuf() {
     -w "$WORDLIST" \
     -mc "$FFUF_CODES" \
     -ac \
+    "${soft404_filter[@]}" \
     -t "$THREADS" \
     -timeout 10 \
     -noninteractive \
@@ -623,6 +979,22 @@ run_ffuf() {
 }
 
 log "5/8: Активная проверка путей через ffuf..."
+
+SCAN_HOSTS="$SUB_DIR/scan_hosts.txt"
+: > "$SCAN_HOSTS"
+
+# live_hosts.txt хранит URL; преобразуем их обратно в hostnames.
+if [[ -s "$LIVE_HOSTS" ]]; then
+  sed -E 's#^https?://##; s#/.*$##; s/:.*$//' "$LIVE_HOSTS" |
+    sed '/^[[:space:]]*$/d' |
+    sort -u > "$SCAN_HOSTS"
+fi
+
+# Корневой домен сканируем всегда, если он не попал в список выше.
+printf '%s\n' "$DOMAIN" >> "$SCAN_HOSTS"
+sort -u -o "$SCAN_HOSTS" "$SCAN_HOSTS"
+
+log "Хостов для ffuf после фильтра заглушек: $(wc -l < "$SCAN_HOSTS" | tr -d ' ')"
 
 while IFS= read -r host; do
   [[ -n "$host" ]] || continue
@@ -641,7 +1013,7 @@ while IFS= read -r host; do
   run_ffuf "$host" "/api" "api" "$scheme" "$tls_mode"
 
   sleep 0.2
-done < "$ALL_SUBDOMAINS"
+done < "$SCAN_HOSTS"
 
 : > "$FFUF_RAW"
 
@@ -686,7 +1058,9 @@ log "6/8: Объединение кандидатов и проверка чер
 log "Всего кандидатов для httpx: $(wc -l < "$ALL_CANDIDATES" | tr -d ' ')"
 
 : > "$HTTPX_JSON"
+: > "$ACTIVE_HITS_PRE"
 : > "$ACTIVE_HITS"
+: > "$SOFT404_REJECTED"
 
 if [[ -s "$ALL_CANDIDATES" ]]; then
   "$HTTPX_BIN" \
@@ -707,10 +1081,16 @@ if [[ -s "$ALL_CANDIDATES" ]]; then
     | (.url // .input // empty)
   ' "$HTTPX_JSON" 2>> "$LOG_DIR/httpx_urls.stderr.log" |
     sed '/^[[:space:]]*$/d' |
-    sort -u > "$ACTIVE_HITS" || true
+    sort -u > "$ACTIVE_HITS_PRE" || true
+
+  if [[ -s "$ACTIVE_HITS_PRE" ]]; then
+    filter_soft404_hits "$ACTIVE_HITS_PRE" "$ACTIVE_HITS" "$SOFT404_REJECTED"
+  fi
 fi
 
 log "Ответов httpx: $(wc -l < "$HTTPX_JSON" | tr -d ' ')"
+log "Кандидатов до soft-404 фильтра: $(wc -l < "$ACTIVE_HITS_PRE" | tr -d ' ')"
+log "Исключено soft-404: $(wc -l < "$SOFT404_REJECTED" | tr -d ' ')"
 log "Активных интересных URL: $(wc -l < "$ACTIVE_HITS" | tr -d ' ')"
 
 ###############################################################################
@@ -833,7 +1213,9 @@ log "8/8: Формирование сводки..."
   printf 'From gau URLs: %s\n' "$(wc -l < "$GAU_SUBDOMAINS" | tr -d ' ')"
   printf 'User supplied: %s\n' "$(wc -l < "$USER_SUBDOMAINS" | tr -d ' ')"
   printf 'All unique hosts: %s\n' "$(wc -l < "$ALL_SUBDOMAINS" | tr -d ' ')"
-  printf 'Live web hosts: %s\n' "$(wc -l < "$LIVE_HOSTS" | tr -d ' ')"
+  printf 'Responding web hosts before placeholder filter: %s\n' "$(wc -l < "$LIVE_HOSTS_PRE" | tr -d ' ')"
+  printf 'Rejected placeholder subdomains: %s\n' "$(wc -l < "$PLACEHOLDER_SUBDOMAINS" | tr -d ' ')"
+  printf 'Live web hosts after placeholder filter: %s\n' "$(wc -l < "$LIVE_HOSTS" | tr -d ' ')"
 
   printf '\nURLs\n'
   printf '----\n'
@@ -841,6 +1223,8 @@ log "8/8: Формирование сводки..."
   printf 'Interesting historical URLs: %s\n' "$(wc -l < "$INTERESTING_HIST" | tr -d ' ')"
   printf 'Unique ffuf hits: %s\n' "$(wc -l < "$FFUF_HITS" | tr -d ' ')"
   printf 'All candidates: %s\n' "$(wc -l < "$ALL_CANDIDATES" | tr -d ' ')"
+  printf 'Candidates before soft-404 filtering: %s\n' "$(wc -l < "$ACTIVE_HITS_PRE" | tr -d ' ')"
+  printf 'Rejected soft-404 URLs: %s\n' "$(wc -l < "$SOFT404_REJECTED" | tr -d ' ')"
   printf 'Active interesting URLs: %s\n' "$(wc -l < "$ACTIVE_HITS" | tr -d ' ')"
 
   printf '\nCategories\n'
@@ -858,9 +1242,11 @@ log "8/8: Формирование сводки..."
   printf '---------------\n'
   printf '%s\n' "$ALL_SUBDOMAINS"
   printf '%s\n' "$LIVE_HOSTS"
+  printf '%s\n' "$PLACEHOLDER_SUBDOMAINS"
   printf '%s\n' "$ALL_URLS"
   printf '%s\n' "$INTERESTING_HIST"
   printf '%s\n' "$ACTIVE_HITS"
+  printf '%s\n' "$SOFT404_REJECTED"
   printf '%s\n' "$PRIORITY_HITS"
   printf '%s\n' "$HTTPX_JSON"
   printf '%s\n' "$RUN_LOG"
