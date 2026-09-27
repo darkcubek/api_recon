@@ -14,6 +14,8 @@ INSTALL_TOOLS=0
 AUTHORIZED=0
 INSECURE=0
 DOWNLOAD_SPECS=1
+DEBUG=0
+WAYBACK_TIMEOUT=180
 
 usage() {
   cat <<EOF
@@ -32,6 +34,7 @@ usage() {
   --no-download-specs          Не скачивать найденные Swagger/OpenAPI-файлы
   --install-tools              Попытаться установить jq, curl, ffuf, gau,
                                waybackurls и ProjectDiscovery httpx
+  -log                        Включить режим отладки и подробные логи
   -h, --help                   Показать эту справку
 
 Примеры:
@@ -46,6 +49,7 @@ EOF
 
 log()  { printf '[+] %s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
+debug() { if [[ "$DEBUG" -eq 1 ]]; then printf '[DEBUG] %s\n' "$*" >&2; fi; }
 die()  { printf '[-] %s\n' "$*" >&2; exit 1; }
 
 cleanup_domain() {
@@ -140,6 +144,10 @@ while (($#)); do
       INSTALL_TOOLS=1
       shift
       ;;
+    -log)
+      DEBUG=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -149,6 +157,11 @@ while (($#)); do
       ;;
   esac
 done
+
+if [[ "$DEBUG" -eq 1 ]]; then
+  set -x
+  debug "Включён режим отладки Bash. Будут показаны все команды и аргументы."
+fi
 
 [[ "$AUTHORIZED" -eq 1 ]] || die "Запуск отменён: добавьте --authorized только при наличии разрешения владельца системы."
 [[ -n "$DOMAIN" ]] || die "Не указан домен. Используйте -d example.com."
@@ -250,6 +263,75 @@ healthz
 status
 actuator
 actuator/health
+mail
+email
+smtp
+support
+contact
+help
+register
+signup
+login
+password
+reset
+recover
+forgot
+account
+profile
+users
+me
+dashboard
+admin
+portal
+app
+web
+wp-json
+well-known
+.well-known
+sso
+oauth2
+oidc
+config
+settings
+backup
+backup.zip
+cms
+site
+public
+private
+internal
+console
+manager
+monitoring
+metrics
+actuator/prometheus
+grafana
+kibana
+log
+logs
+admin/login
+admin/api
+app/api
+api/v1
+api/v2
+api/v3
+v1/users
+v2/users
+v3/users
+auth/login
+auth/token
+oauth/token
+openid/connect
+api-docs
+graphql
+graphiql
+tenant
+tenants
+tenant-admin
+mail/admin
+mail/login
+mail/api
+mail/.well-known
 EOF
 
 # Главный домен всегда входит в активную область.
@@ -280,9 +362,22 @@ log "1/6: Сбор исторических URL через gau..."
 "$GAU_BIN" "$DOMAIN" --subs > "$GAU_FILE" 2> "$LOG_DIR/gau.stderr.log" || warn "gau завершился с ошибкой; смотрите logs/gau.stderr.log"
 
 log "2/6: Сбор URL через Wayback Machine..."
-printf '%s\n' "$DOMAIN" | "$WAYBACK_BIN" > "$WAYBACK_FILE" 2> "$LOG_DIR/waybackurls.stderr.log" || warn "waybackurls завершился с ошибкой; смотрите logs/waybackurls.stderr.log"
+debug "Запуск waybackurls для $DOMAIN. Таймаут: ${WAYBACK_TIMEOUT}s."
+wayback_start=$(date +%s)
+if timeout --preserve-status "${WAYBACK_TIMEOUT}s" bash -lc "printf '%s\n' '$DOMAIN' | '$WAYBACK_BIN' > '$WAYBACK_FILE' 2> '$LOG_DIR/waybackurls.stderr.log'"; then
+  :
+else
+  status=$?
+  warn "waybackurls завершился с кодом $status; смотрите logs/waybackurls.stderr.log"
+  if [[ "$status" -eq 124 ]]; then
+    warn "Wayback Machine превысил таймаут ${WAYBACK_TIMEOUT}s. Это может быть обычным для больших/активных доменов."
+  fi
+fi
+wayback_end=$(date +%s)
+debug "Wayback завершён за $((wayback_end - wayback_start))s. Размер файла: $(wc -l < "$WAYBACK_FILE" | tr -d ' ') строк."
 
 cat "$GAU_FILE" "$WAYBACK_FILE" 2>/dev/null | sed '/^[[:space:]]*$/d' | sort -u > "$ALL_URLS"
+debug "После объединения исторических URL записано $(wc -l < "$ALL_URLS" | tr -d ' ') строк."
 
 grep -iE '/api(/|$)|/v[0-9]+(/|$)|/auth(/|$)|/token|/login|/oauth|/openid|/swagger|/openapi|/api-docs|/docs|/redoc|/admin' \
   "$ALL_URLS" | sort -u > "$API_CANDIDATES" || true
