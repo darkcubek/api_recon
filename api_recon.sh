@@ -1,21 +1,25 @@
 #!/usr/bin/env bash
+
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
 SCRIPT_NAME="$(basename "$0")"
+
 DOMAIN=""
 SUBDOMAINS_FILE=""
 OUTPUT_DIR=""
 THREADS=20
+
 FFUF_CODES="200,201,204,301,302,307,308,400,401,403,405"
 HTTPX_CODES="200,201,204,301,302,307,308,400,401,403,405"
+
 INSTALL_TOOLS=0
 AUTHORIZED=0
 INSECURE=0
 DOWNLOAD_SPECS=1
 DEBUG=0
-WAYBACK_TIMEOUT=180
+PASSIVE_TIMEOUT=120
 
 usage() {
   cat <<EOF
@@ -23,87 +27,35 @@ usage() {
   $SCRIPT_NAME --authorized -d example.com [параметры]
 
 Обязательные параметры:
-  -d, --domain DOMAIN          Корневой домен без пути, например example.com
-  --authorized                Подтверждение, что у вас есть разрешение на тестирование
+  -d, --domain DOMAIN          Корневой домен, например example.com
+  --authorized                Подтверждение разрешения на тестирование
 
 Дополнительные параметры:
-  -s, --subdomains FILE        Файл с субдоменами, по одному в строке
-  -o, --output DIR             Каталог результатов
-  -t, --threads N              Потоки ffuf/httpx, по умолчанию: 20, максимум: 50
-  --insecure                   Не проверять TLS-сертификаты в ffuf/curl
-  --no-download-specs          Не скачивать найденные Swagger/OpenAPI-файлы
-  --install-tools              Попытаться установить jq, curl, ffuf, gau,
-                               waybackurls и ProjectDiscovery httpx
-  -log                        Включить режим отладки и подробные логи
-  -h, --help                   Показать эту справку
+  -s, --subdomains FILE       Дополнительный файл с субдоменами
+  -o, --output DIR            Каталог результатов
+  -t, --threads N             Потоки ffuf/httpx, по умолчанию 20, максимум 50
+  --passive-timeout N         Таймаут пассивных инструментов, по умолчанию 120 сек
+  --insecure                  Не проверять TLS-сертификаты
+  --no-download-specs         Не скачивать Swagger/OpenAPI
+  --install-tools             Установить необходимые инструменты
+  -log, --debug               Подробный режим отладки
+  -h, --help                  Справка
+
+Важно:
+  Рядом со скриптом должен находиться файл wordlist.txt.
 
 Примеры:
   chmod +x $SCRIPT_NAME
   ./$SCRIPT_NAME --authorized -d example.com
-  ./$SCRIPT_NAME --authorized -d example.com -s subdomains.txt -t 15
-
-Результаты сохраняются в отдельный каталог. Скрипт не эксплуатирует
-уязвимости, не перебирает учётные данные и не отправляет изменяющие запросы.
+  ./$SCRIPT_NAME --authorized -d example.com --debug
+  ./$SCRIPT_NAME --authorized -d example.com -s subdomains.txt
 EOF
 }
 
-log()  { printf '[+] %s\n' "$*"; }
-warn() { printf '[!] %s\n' "$*" >&2; }
-debug() { if [[ "$DEBUG" -eq 1 ]]; then printf '[DEBUG] %s\n' "$*" >&2; fi; }
-run_logged_command() {
-  local label="$1"
-  local output_file="${2:-}"
-  shift 2
-
-  local stdout_log="$LOG_DIR/${label}.stdout.log"
-  local stderr_log="$LOG_DIR/${label}.stderr.log"
-  : > "$stdout_log"
-  : > "$stderr_log"
-
-  if [[ "$DEBUG" -eq 1 ]]; then
-    log "[$label] запуск..."
-  fi
-
-  if [[ -n "$output_file" ]]; then
-    if "$@" > "$stdout_log" 2> "$stderr_log" && [[ -n "$output_file" ]]; then
-      if [[ -s "$stdout_log" ]]; then
-        cat "$stdout_log" > "$output_file"
-      else
-        warn "[$label] завершилась успешно, но ничего не вывела в stdout. Ожидался результат: $output_file"
-        : > "$output_file"
-      fi
-      if [[ "$DEBUG" -eq 1 ]]; then
-        log "[$label] завершена. Лог: $stdout_log | $stderr_log"
-      fi
-      return 0
-    else
-      local rc=$?
-      warn "[$label] завершилась с кодом $rc. Логи: $stdout_log, $stderr_log"
-      if [[ ! -s "$stdout_log" && ! -s "$stderr_log" ]]; then
-        warn "[$label] ничего не вывела в stdout/stderr."
-      fi
-      return $rc
-    fi
-  fi
-
-  if "$@" > "$stdout_log" 2> "$stderr_log"; then
-    if [[ ! -s "$stdout_log" && ! -s "$stderr_log" ]]; then
-      warn "[$label] завершилась успешно, но ничего не вывела в stdout/stderr."
-    fi
-    if [[ "$DEBUG" -eq 1 ]]; then
-      log "[$label] завершена. Лог: $stdout_log | $stderr_log"
-    fi
-    return 0
-  else
-    local rc=$?
-    warn "[$label] завершилась с кодом $rc. Логи: $stdout_log, $stderr_log"
-    if [[ ! -s "$stdout_log" && ! -s "$stderr_log" ]]; then
-      warn "[$label] ничего не вывела в stdout/stderr."
-    fi
-    return $rc
-  fi
-}
-die()  { printf '[-] %s\n' "$*" >&2; exit 1; }
+log()   { printf '[+] %s\n' "$*"; }
+warn()  { printf '[!] %s\n' "$*" >&2; }
+die()   { printf '[-] %s\n' "$*" >&2; exit 1; }
+debug() { [[ "$DEBUG" -eq 1 ]] && printf '[DEBUG] %s\n' "$*" >&2 || true; }
 
 cleanup_domain() {
   local value="$1"
@@ -127,24 +79,34 @@ host_in_scope() {
 }
 
 safe_filename() {
-  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's#[^a-z0-9._-]+#_#g; s#^_+|_+$##g'
+  printf '%s' "$1" |
+    tr '[:upper:]' '[:lower:]' |
+    sed -E 's#[^a-z0-9._-]+#_#g; s#^_+|_+$##g'
 }
 
 resolve_tool() {
   local name="$1"
   local candidate
-  for candidate in "$HOME/go/bin/$name" "/usr/local/bin/$name" "/usr/bin/$name"; do
+
+  for candidate in \
+    "$HOME/go/bin/$name" \
+    "/usr/local/bin/$name" \
+    "/usr/bin/$name"; do
     if [[ -x "$candidate" ]]; then
       printf '%s' "$candidate"
       return 0
     fi
   done
+
   command -v "$name" 2>/dev/null || return 1
 }
 
 install_tools() {
   log "Установка системных зависимостей..."
-  command -v sudo >/dev/null 2>&1 || die "Для --install-tools необходим sudo."
+
+  command -v sudo >/dev/null 2>&1 ||
+    die "Для --install-tools необходим sudo."
+
   sudo apt-get update
   sudo apt-get install -y jq curl ca-certificates golang-go ffuf
 
@@ -153,10 +115,69 @@ install_tools() {
 
   log "Установка gau..."
   go install github.com/lc/gau/v2/cmd/gau@latest
+
   log "Установка waybackurls..."
   go install github.com/tomnomnom/waybackurls@latest
+
   log "Установка ProjectDiscovery httpx..."
   go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+
+  log "Установка subfinder..."
+  go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+}
+
+run_with_timeout() {
+  local label="$1"
+  local outfile="$2"
+  local errfile="$3"
+  shift 3
+
+  : > "$outfile"
+  : > "$errfile"
+
+  debug "$label: запуск: $*"
+  debug "$label: таймаут ${PASSIVE_TIMEOUT}s"
+
+  local start now elapsed pid
+  start="$(date +%s)"
+
+  timeout --preserve-status "${PASSIVE_TIMEOUT}s" "$@" \
+    > "$outfile" 2> "$errfile" &
+  pid=$!
+
+  if [[ "$DEBUG" -eq 1 ]]; then
+    while kill -0 "$pid" 2>/dev/null; do
+      sleep 5
+      now="$(date +%s)"
+      elapsed=$((now - start))
+      debug "$label: выполняется ${elapsed}s; строк: $(wc -l < "$outfile" 2>/dev/null | tr -d ' ')"
+    done
+  fi
+
+  local rc=0
+  wait "$pid" || rc=$?
+
+  elapsed=$(($(date +%s) - start))
+
+  if [[ "$rc" -eq 124 || "$rc" -eq 143 ]]; then
+    warn "$label: превышен таймаут ${PASSIVE_TIMEOUT}s."
+  elif [[ "$rc" -ne 0 ]]; then
+    warn "$label: завершился с кодом $rc."
+  else
+    debug "$label: завершён за ${elapsed}s."
+  fi
+
+  if [[ ! -s "$outfile" ]]; then
+    warn "$label: получено 0 строк."
+    if [[ -s "$errfile" ]]; then
+      warn "$label: последние сообщения stderr:"
+      tail -n 10 "$errfile" >&2 || true
+    fi
+  else
+    debug "$label: получено $(wc -l < "$outfile" | tr -d ' ') строк."
+  fi
+
+  return 0
 }
 
 while (($#)); do
@@ -167,7 +188,7 @@ while (($#)); do
       shift 2
       ;;
     -s|--subdomains)
-      [[ $# -ge 2 ]] || die "После $1 нужен путь к файлу."
+      [[ $# -ge 2 ]] || die "После $1 нужен файл."
       SUBDOMAINS_FILE="$2"
       shift 2
       ;;
@@ -179,6 +200,11 @@ while (($#)); do
     -t|--threads)
       [[ $# -ge 2 ]] || die "После $1 нужно число."
       THREADS="$2"
+      shift 2
+      ;;
+    --passive-timeout)
+      [[ $# -ge 2 ]] || die "После $1 нужно число секунд."
+      PASSIVE_TIMEOUT="$2"
       shift 2
       ;;
     --authorized)
@@ -197,7 +223,7 @@ while (($#)); do
       INSTALL_TOOLS=1
       shift
       ;;
-    -log)
+    -log|--debug)
       DEBUG=1
       shift
       ;;
@@ -206,22 +232,27 @@ while (($#)); do
       exit 0
       ;;
     *)
-      die "Неизвестный параметр: $1. Используйте --help."
+      die "Неизвестный параметр: $1"
       ;;
   esac
 done
 
-if [[ "$DEBUG" -eq 1 ]]; then
-  set -x
-  debug "Включён режим отладки Bash. Будут показаны все команды и аргументы."
-fi
+[[ "$AUTHORIZED" -eq 1 ]] ||
+  die "Добавьте --authorized только при наличии разрешения владельца системы."
 
-[[ "$AUTHORIZED" -eq 1 ]] || die "Запуск отменён: добавьте --authorized только при наличии разрешения владельца системы."
-[[ -n "$DOMAIN" ]] || die "Не указан домен. Используйте -d example.com."
+[[ -n "$DOMAIN" ]] ||
+  die "Не указан домен. Используйте -d example.com."
+
 DOMAIN="$(cleanup_domain "$DOMAIN")"
 valid_domain "$DOMAIN" || die "Некорректный домен: $DOMAIN"
-[[ "$THREADS" =~ ^[0-9]+$ ]] || die "--threads должен быть целым числом."
-(( THREADS >= 1 && THREADS <= 50 )) || die "--threads должен быть от 1 до 50."
+
+[[ "$THREADS" =~ ^[0-9]+$ ]] ||
+  die "--threads должен быть целым числом."
+(( THREADS >= 1 && THREADS <= 50 )) ||
+  die "--threads должен быть от 1 до 50."
+
+[[ "$PASSIVE_TIMEOUT" =~ ^[0-9]+$ ]] ||
+  die "--passive-timeout должен быть числом."
 
 if [[ -n "$SUBDOMAINS_FILE" && ! -r "$SUBDOMAINS_FILE" ]]; then
   die "Не удаётся прочитать файл субдоменов: $SUBDOMAINS_FILE"
@@ -233,136 +264,328 @@ fi
 
 GAU_BIN="$(resolve_tool gau || true)"
 WAYBACK_BIN="$(resolve_tool waybackurls || true)"
+SUBFINDER_BIN="$(resolve_tool subfinder || true)"
 FFUF_BIN="$(resolve_tool ffuf || true)"
 HTTPX_BIN="$(resolve_tool httpx || true)"
 JQ_BIN="$(resolve_tool jq || true)"
 CURL_BIN="$(resolve_tool curl || true)"
 
-[[ -n "$GAU_BIN" ]] || die "Не найден gau. Повторите с --install-tools или установите его вручную."
-[[ -n "$WAYBACK_BIN" ]] || die "Не найден waybackurls. Повторите с --install-tools или установите его вручную."
-[[ -n "$FFUF_BIN" ]] || die "Не найден ffuf. Повторите с --install-tools или: sudo apt install ffuf"
-[[ -n "$HTTPX_BIN" ]] || die "Не найден ProjectDiscovery httpx. Повторите с --install-tools."
-[[ -n "$JQ_BIN" ]] || die "Не найден jq. Установите: sudo apt install jq"
-[[ -n "$CURL_BIN" ]] || die "Не найден curl. Установите: sudo apt install curl"
+[[ -n "$GAU_BIN" ]] || die "Не найден gau."
+[[ -n "$WAYBACK_BIN" ]] || die "Не найден waybackurls."
+[[ -n "$SUBFINDER_BIN" ]] || die "Не найден subfinder."
+[[ -n "$FFUF_BIN" ]] || die "Не найден ffuf."
+[[ -n "$HTTPX_BIN" ]] || die "Не найден ProjectDiscovery httpx."
+[[ -n "$JQ_BIN" ]] || die "Не найден jq."
+[[ -n "$CURL_BIN" ]] || die "Не найден curl."
 
-# Защита от случайного выбора Python-пакета httpx вместо ProjectDiscovery httpx.
-# Не используем grep -q вместе с pipefail: grep может закрыть pipe после первого
-# совпадения, httpx получит SIGPIPE, и корректный бинарник будет ошибочно отклонён.
 HTTPX_HELP="$("$HTTPX_BIN" -h 2>&1 || true)"
-if ! grep -iE 'projectdiscovery|http toolkit|status-code|tech-detect' <<< "$HTTPX_HELP" >/dev/null; then
+if ! grep -iE 'projectdiscovery|http toolkit|status-code|tech-detect' \
+  <<< "$HTTPX_HELP" >/dev/null; then
+
   HTTPX_VERSION="$("$HTTPX_BIN" -version 2>&1 || true)"
-  if ! grep -iE 'httpx|projectdiscovery' <<< "$HTTPX_VERSION" >/dev/null; then
-    die "Команда '$HTTPX_BIN' не похожа на ProjectDiscovery httpx. Проверка: $HTTPX_BIN -version"
+
+  if ! grep -iE 'httpx|projectdiscovery' \
+    <<< "$HTTPX_VERSION" >/dev/null; then
+    die "Команда '$HTTPX_BIN' не похожа на ProjectDiscovery httpx."
   fi
 fi
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+
 if [[ -z "$OUTPUT_DIR" ]]; then
   OUTPUT_DIR="api_recon_${DOMAIN}_${TIMESTAMP}"
 fi
+
 OUTPUT_DIR="$(mkdir -p "$OUTPUT_DIR" && cd "$OUTPUT_DIR" && pwd)"
 
 HIST_DIR="$OUTPUT_DIR/historical"
+SUB_DIR="$OUTPUT_DIR/subdomains"
 FFUF_DIR="$OUTPUT_DIR/ffuf"
 CAND_DIR="$OUTPUT_DIR/candidates"
 SPECS_DIR="$OUTPUT_DIR/specs"
 LOG_DIR="$OUTPUT_DIR/logs"
-mkdir -p "$HIST_DIR" "$FFUF_DIR" "$CAND_DIR" "$SPECS_DIR" "$LOG_DIR"
+
+mkdir -p \
+  "$HIST_DIR" \
+  "$SUB_DIR" \
+  "$FFUF_DIR" \
+  "$CAND_DIR" \
+  "$SPECS_DIR" \
+  "$LOG_DIR"
+
+RUN_LOG="$LOG_DIR/run.log"
+touch "$RUN_LOG"
+
+# Сохраняем весь вывод в run.log и одновременно показываем его на экране.
+exec > >(tee -a "$RUN_LOG") 2> >(tee -a "$RUN_LOG" >&2)
 
 GAU_FILE="$HIST_DIR/gau.txt"
 WAYBACK_FILE="$HIST_DIR/waybackurls.txt"
 ALL_URLS="$HIST_DIR/all_urls.txt"
-API_CANDIDATES="$HIST_DIR/api_candidates.txt"
+INTERESTING_HIST="$HIST_DIR/interesting_urls.txt"
+
+SUBFINDER_FILE="$SUB_DIR/subfinder.txt"
+GAU_SUBDOMAINS="$SUB_DIR/gau_subdomains.txt"
+USER_SUBDOMAINS="$SUB_DIR/user_subdomains.txt"
+ALL_SUBDOMAINS="$SUB_DIR/all_subdomains.txt"
+LIVE_HOSTS_JSON="$SUB_DIR/live_hosts.jsonl"
+LIVE_HOSTS="$SUB_DIR/live_hosts.txt"
+
 HOSTS_FILE="$OUTPUT_DIR/hosts_in_scope.txt"
-WORDLIST="$OUTPUT_DIR/api_wordlist.txt"
+
+WORDLIST="$OUTPUT_DIR/wordlist.txt"
+WORDLIST_SOURCE="$(cd "$(dirname "$0")" && pwd)/wordlist.txt"
+
 FFUF_RAW="$CAND_DIR/ffuf_hits_raw.txt"
 FFUF_HITS="$CAND_DIR/ffuf_hits.txt"
 ALL_CANDIDATES="$CAND_DIR/all_candidates.txt"
 HTTPX_JSON="$CAND_DIR/httpx_results.jsonl"
+
 ACTIVE_HITS="$CAND_DIR/active_hits.txt"
 PRIORITY_HITS="$CAND_DIR/priority_hits.txt"
 AUTH_HITS="$CAND_DIR/auth_login_token.txt"
 API_DOC_HITS="$CAND_DIR/swagger_openapi_docs.txt"
+MAIL_HITS="$CAND_DIR/mail_webmail.txt"
+ADMIN_HITS="$CAND_DIR/admin_panels.txt"
 INTERNAL_HITS="$CAND_DIR/internal_debug.txt"
-SUMMARY="$OUTPUT_DIR/summary.txt"
-WORDLIST_SOURCE="$(cd "$(dirname "$0")" && pwd)/wordlist.txt"
+FILES_HITS="$CAND_DIR/files_backups.txt"
 
-if [[ ! -r "$WORDLIST_SOURCE" ]]; then
+SUMMARY="$OUTPUT_DIR/summary.txt"
+
+[[ -r "$WORDLIST_SOURCE" ]] ||
   die "Не найден файл словаря: $WORDLIST_SOURCE"
-fi
+
 cp "$WORDLIST_SOURCE" "$WORDLIST"
 
-# Главный домен всегда входит в активную область.
-printf '%s\n' "$DOMAIN" > "$HOSTS_FILE"
+log "Область: $DOMAIN"
+log "Каталог результатов: $OUTPUT_DIR"
+log "Словарь: $WORDLIST_SOURCE ($(wc -l < "$WORDLIST" | tr -d ' ') строк)"
+log "Полный лог: $RUN_LOG"
 
-# Добавляем только субдомены того же корневого домена.
+if [[ "$DEBUG" -eq 1 ]]; then
+  debug "Используемые бинарники:"
+  debug "gau: $GAU_BIN"
+  debug "waybackurls: $WAYBACK_BIN"
+  debug "subfinder: $SUBFINDER_BIN"
+  debug "ffuf: $FFUF_BIN"
+  debug "httpx: $HTTPX_BIN"
+  debug "jq: $JQ_BIN"
+  debug "curl: $CURL_BIN"
+
+  debug "DNS:"
+  getent ahosts "$DOMAIN" 2>&1 | head -n 20 >&2 || true
+fi
+
+###############################################################################
+# 1/8 SUBDOMAIN DISCOVERY
+###############################################################################
+
+log "1/8: Поиск субдоменов через subfinder..."
+
+run_with_timeout \
+  "subfinder" \
+  "$SUBFINDER_FILE" \
+  "$LOG_DIR/subfinder.stderr.log" \
+  "$SUBFINDER_BIN" \
+    -d "$DOMAIN" \
+    -silent
+
+###############################################################################
+# 2/8 GAU
+###############################################################################
+
+log "2/8: Сбор исторических URL через gau..."
+
+# CommonCrawl намеренно исключён: в ряде сетей он часто зависает.
+run_with_timeout \
+  "gau" \
+  "$GAU_FILE" \
+  "$LOG_DIR/gau.stderr.log" \
+  "$GAU_BIN" \
+    --providers wayback,otx,urlscan \
+    --timeout 15 \
+    --retries 2 \
+    --subs \
+    "$DOMAIN"
+
+if [[ -s "$GAU_FILE" ]]; then
+  grep -E '^https?://' "$GAU_FILE" |
+    sed '/^[[:space:]]*$/d' |
+    sort -u > "$GAU_FILE.tmp" || true
+
+  mv "$GAU_FILE.tmp" "$GAU_FILE"
+fi
+
+###############################################################################
+# 3/8 WAYBACKURLS
+###############################################################################
+
+log "3/8: Сбор URL через waybackurls..."
+
+: > "$WAYBACK_FILE"
+
+# waybackurls получает домен через stdin.
+if [[ "$DEBUG" -eq 1 ]]; then
+  debug "waybackurls: домен $DOMAIN, timeout ${PASSIVE_TIMEOUT}s"
+fi
+
+set +e
+printf '%s\n' "$DOMAIN" |
+  timeout --preserve-status "${PASSIVE_TIMEOUT}s" "$WAYBACK_BIN" \
+  > "$WAYBACK_FILE" \
+  2> "$LOG_DIR/waybackurls.stderr.log"
+WAYBACK_RC=$?
+set -e
+
+if [[ "$WAYBACK_RC" -ne 0 ]]; then
+  warn "waybackurls завершился с кодом $WAYBACK_RC."
+fi
+
+if [[ ! -s "$WAYBACK_FILE" ]]; then
+  warn "waybackurls вернул 0 URL."
+  if [[ -s "$LOG_DIR/waybackurls.stderr.log" ]]; then
+    tail -n 10 "$LOG_DIR/waybackurls.stderr.log" >&2 || true
+  fi
+fi
+
+###############################################################################
+# SUBDOMAIN MERGE
+###############################################################################
+
+log "4/8: Объединение и проверка найденных субдоменов..."
+
+: > "$GAU_SUBDOMAINS"
+: > "$USER_SUBDOMAINS"
+
+# Извлекаем хосты из URL gau.
+if [[ -s "$GAU_FILE" ]]; then
+  sed -E 's#^https?://##; s#/.*$##; s/:.*$//' "$GAU_FILE" |
+    tr '[:upper:]' '[:lower:]' |
+    sort -u |
+    while IFS= read -r host; do
+      [[ -n "$host" ]] || continue
+      host_in_scope "$host" && printf '%s\n' "$host"
+    done > "$GAU_SUBDOMAINS"
+fi
+
+# Пользовательский список -s сохраняется и тоже объединяется.
 if [[ -n "$SUBDOMAINS_FILE" ]]; then
   while IFS= read -r raw || [[ -n "$raw" ]]; do
     raw="${raw%%#*}"
     raw="$(printf '%s' "$raw" | xargs)"
     [[ -n "$raw" ]] || continue
+
     host="$(cleanup_domain "$raw")"
+
     if valid_domain "$host" && host_in_scope "$host"; then
       printf '%s\n' "$host"
     else
       warn "Пропущен хост вне области или с ошибкой: $raw"
     fi
-  done < "$SUBDOMAINS_FILE" >> "$HOSTS_FILE"
-fi
-sort -u -o "$HOSTS_FILE" "$HOSTS_FILE"
-
-log "Область: $DOMAIN"
-log "Хостов для активной проверки: $(wc -l < "$HOSTS_FILE" | tr -d ' ')"
-log "Каталог результатов: $OUTPUT_DIR"
-
-log "1/6: Сбор исторических URL через gau..."
-# --subs повторяет логику статьи и включает исторические URL субдоменов.
-if run_logged_command "gau" "$GAU_FILE" "$GAU_BIN" "$DOMAIN" --subs; then
-  :
-else
-  warn "gau завершился с ошибкой; смотрите logs/gau.stdout.log и logs/gau.stderr.log"
+  done < "$SUBDOMAINS_FILE" |
+    sort -u > "$USER_SUBDOMAINS"
 fi
 
-log "2/6: Сбор URL через Wayback Machine..."
-debug "Запуск waybackurls для $DOMAIN. Таймаут: ${WAYBACK_TIMEOUT}s."
-wayback_start=$(date +%s)
-if timeout --preserve-status "${WAYBACK_TIMEOUT}s" bash -lc "printf '%s\n' '$DOMAIN' | '$WAYBACK_BIN' > '$WAYBACK_FILE' 2> '$LOG_DIR/waybackurls.stderr.log'"; then
-  :
-else
-  status=$?
-  warn "waybackurls завершился с кодом $status; смотрите logs/waybackurls.stderr.log"
-  if [[ "$status" -eq 124 ]]; then
-    warn "Wayback Machine превысил таймаут ${WAYBACK_TIMEOUT}s. Это может быть обычным для больших/активных доменов."
-  fi
-fi
-wayback_end=$(date +%s)
-debug "Wayback завершён за $((wayback_end - wayback_start))s. Размер файла: $(wc -l < "$WAYBACK_FILE" | tr -d ' ') строк."
-if [[ ! -s "$WAYBACK_FILE" ]]; then
-  warn "Wayback Machine ничего не вернул для $DOMAIN. Проверьте logs/waybackurls.stderr.log"
+{
+  printf '%s\n' "$DOMAIN"
+  cat "$SUBFINDER_FILE" 2>/dev/null || true
+  cat "$GAU_SUBDOMAINS" 2>/dev/null || true
+  cat "$USER_SUBDOMAINS" 2>/dev/null || true
+} |
+  sed '/^[[:space:]]*$/d' |
+  tr '[:upper:]' '[:lower:]' |
+  sort -u |
+  while IFS= read -r host; do
+    host_in_scope "$host" && printf '%s\n' "$host"
+  done > "$ALL_SUBDOMAINS"
+
+cp "$ALL_SUBDOMAINS" "$HOSTS_FILE"
+
+log "Найдено уникальных хостов в области: $(wc -l < "$ALL_SUBDOMAINS" | tr -d ' ')"
+
+: > "$LIVE_HOSTS_JSON"
+: > "$LIVE_HOSTS"
+
+if [[ -s "$ALL_SUBDOMAINS" ]]; then
+  "$HTTPX_BIN" \
+    -l "$ALL_SUBDOMAINS" \
+    -silent \
+    -json \
+    -follow-redirects \
+    -title \
+    -tech-detect \
+    -t "$THREADS" \
+    -o "$LIVE_HOSTS_JSON" \
+    2> "$LOG_DIR/httpx_hosts.stderr.log" || true
+
+  "$JQ_BIN" -r '
+    select(.failed == false)
+    | (.url // .input // empty)
+  ' "$LIVE_HOSTS_JSON" 2>/dev/null |
+    sed '/^[[:space:]]*$/d' |
+    sort -u > "$LIVE_HOSTS" || true
 fi
 
-cat "$GAU_FILE" "$WAYBACK_FILE" 2>/dev/null | sed '/^[[:space:]]*$/d' | sort -u > "$ALL_URLS"
-debug "После объединения исторических URL записано $(wc -l < "$ALL_URLS" | tr -d ' ') строк."
+log "Живых web-хостов: $(wc -l < "$LIVE_HOSTS" | tr -d ' ')"
 
-grep -iE '/api(/|$)|/v[0-9]+(/|$)|/auth(/|$)|/token|/login|/oauth|/openid|/swagger|/openapi|/api-docs|/docs|/redoc|/admin' \
-  "$ALL_URLS" | sort -u > "$API_CANDIDATES" || true
+###############################################################################
+# HISTORICAL MERGE
+###############################################################################
+
+cat "$GAU_FILE" "$WAYBACK_FILE" 2>/dev/null |
+  grep -E '^https?://' |
+  sed '/^[[:space:]]*$/d' |
+  sort -u > "$ALL_URLS" || true
+
+grep -iE \
+'/api(/|$)|/v[0-9]+(/|$)|/auth(/|$)|/token|/login|/signin|/oauth|/openid|/swagger|/openapi|/api-docs|/docs|/redoc|/admin|/administrator|/dashboard|/panel|/portal|/mail|/webmail|/roundcube|/owa|/autodiscover|/phpmyadmin|/adminer|/graphql|/graphiql|/server-status|/server-info|/metrics|/monitor|/grafana|/actuator|/health|/status|/backup|/backups|/debug|/internal' \
+  "$ALL_URLS" |
+  sort -u > "$INTERESTING_HIST" || true
 
 log "Исторических URL: $(wc -l < "$ALL_URLS" | tr -d ' ')"
-log "API-кандидатов: $(wc -l < "$API_CANDIDATES" | tr -d ' ')"
+log "Интересных исторических URL: $(wc -l < "$INTERESTING_HIST" | tr -d ' ')"
+
+###############################################################################
+# 5/8 FFUF
+###############################################################################
 
 choose_scheme() {
   local host="$1"
-  local curl_tls=()
-  [[ "$INSECURE" -eq 1 ]] && curl_tls=(-k)
 
-  if "$CURL_BIN" "${curl_tls[@]}" -sS -o /dev/null --connect-timeout 5 --max-time 8 "https://$host/"; then
-    printf 'https'
-  elif "$CURL_BIN" -sS -o /dev/null --connect-timeout 5 --max-time 8 "http://$host/"; then
-    printf 'http'
-  else
-    # HTTPS остаётся безопасным значением по умолчанию; ffuf запишет ошибку в лог.
-    printf 'https'
+  if "$CURL_BIN" \
+      -sS \
+      -o /dev/null \
+      --connect-timeout 5 \
+      --max-time 8 \
+      "https://$host/"; then
+    printf 'https|verify'
+    return
   fi
+
+  # Если HTTPS работает только при отключённой проверке сертификата,
+  # всё равно используем HTTPS, а не переключаемся ошибочно на HTTP.
+  if "$CURL_BIN" \
+      -k \
+      -sS \
+      -o /dev/null \
+      --connect-timeout 5 \
+      --max-time 8 \
+      "https://$host/"; then
+    printf 'https|insecure'
+    return
+  fi
+
+  if "$CURL_BIN" \
+      -sS \
+      -o /dev/null \
+      --connect-timeout 5 \
+      --max-time 8 \
+      "http://$host/"; then
+    printf 'http|verify'
+    return
+  fi
+
+  printf 'https|unreachable'
 }
 
 run_ffuf() {
@@ -370,16 +593,24 @@ run_ffuf() {
   local base_path="$2"
   local label="$3"
   local scheme="$4"
+  local tls_mode="$5"
+
   local host_name
   local ffuf_tls=()
+
   host_name="$(safe_filename "$host")"
-  [[ "$INSECURE" -eq 1 ]] && ffuf_tls=(-k)
+
+  if [[ "$INSECURE" -eq 1 || "$tls_mode" == "insecure" ]]; then
+    ffuf_tls=(-k)
+  fi
 
   log "ffuf: $scheme://$host$base_path/FUZZ"
+
   "$FFUF_BIN" \
     -u "$scheme://$host$base_path/FUZZ" \
     -w "$WORDLIST" \
     -mc "$FFUF_CODES" \
+    -ac \
     -t "$THREADS" \
     -timeout 10 \
     -noninteractive \
@@ -391,127 +622,164 @@ run_ffuf() {
     2> "$LOG_DIR/${host_name}_${label}.stderr.log" || true
 }
 
-log "3/6: Активная проверка известных API-путей через ffuf..."
+log "5/8: Активная проверка путей через ffuf..."
+
 while IFS= read -r host; do
   [[ -n "$host" ]] || continue
-  scheme="$(choose_scheme "$host")"
-  run_ffuf "$host" "" "root" "$scheme"
-  run_ffuf "$host" "/api" "api" "$scheme"
-  sleep 0.25
-done < "$HOSTS_FILE"
+
+  scheme_info="$(choose_scheme "$host")"
+  scheme="${scheme_info%%|*}"
+  tls_mode="${scheme_info##*|}"
+
+  if [[ "$tls_mode" == "unreachable" ]]; then
+    warn "$host: curl не подтвердил доступность; ffuf всё равно попробует HTTPS."
+  fi
+
+  debug "$host -> $scheme ($tls_mode)"
+
+  run_ffuf "$host" "" "root" "$scheme" "$tls_mode"
+  run_ffuf "$host" "/api" "api" "$scheme" "$tls_mode"
+
+  sleep 0.2
+done < "$ALL_SUBDOMAINS"
 
 : > "$FFUF_RAW"
+
 shopt -s nullglob
 for json_file in "$FFUF_DIR"/*.json; do
   [[ -s "$json_file" ]] || continue
-  "$JQ_BIN" -r '.results[]?.url // empty' "$json_file" 2>/dev/null >> "$FFUF_RAW" || true
+
+  "$JQ_BIN" -r \
+    '.results[]?.url // empty' \
+    "$json_file" \
+    2>/dev/null >> "$FFUF_RAW" || true
 done
 shopt -u nullglob
+
 sort -u "$FFUF_RAW" > "$FFUF_HITS"
 
 log "Найдено уникальных URL через ffuf: $(wc -l < "$FFUF_HITS" | tr -d ' ')"
 
-log "4/6: Объединение кандидатов и проверка через ProjectDiscovery httpx..."
+###############################################################################
+# 6/8 HTTPX URL VALIDATION
+###############################################################################
 
-# Раньше httpx проверял только FFUF_HITS. Из-за этого URL, найденные gau/wayback,
-# не могли попасть ни в active_hits.txt, ни в priority_hits.txt.
-# Объединяем оба источника и оставляем только http(s)-URL внутри разрешённой области.
+log "6/8: Объединение кандидатов и проверка через httpx..."
+
 {
-  cat "$API_CANDIDATES" "$FFUF_HITS" 2>/dev/null || true
-} | sed '/^[[:space:]]*$/d' | sort -u | while IFS= read -r url; do
-  [[ "$url" =~ ^https?:// ]] || continue
-  host="${url#*://}"
-  host="${host%%/*}"
-  host="${host%%:*}"
-  host="${host,,}"
-  host_in_scope "$host" && printf '%s\n' "$url"
-done > "$ALL_CANDIDATES"
+  cat "$INTERESTING_HIST" 2>/dev/null || true
+  cat "$FFUF_HITS" 2>/dev/null || true
+} |
+  sed '/^[[:space:]]*$/d' |
+  sort -u |
+  while IFS= read -r url; do
+    [[ "$url" =~ ^https?:// ]] || continue
 
-log "Всего уникальных кандидатов для httpx: $(wc -l < "$ALL_CANDIDATES" | tr -d ' ')"
+    host="${url#*://}"
+    host="${host%%/*}"
+    host="${host%%:*}"
+    host="${host,,}"
 
-: > "$ACTIVE_HITS"
+    host_in_scope "$host" && printf '%s\n' "$url"
+  done > "$ALL_CANDIDATES"
+
+log "Всего кандидатов для httpx: $(wc -l < "$ALL_CANDIDATES" | tr -d ' ')"
+
 : > "$HTTPX_JSON"
+: > "$ACTIVE_HITS"
 
 if [[ -s "$ALL_CANDIDATES" ]]; then
-  # JSON-режим нужен, чтобы не зависеть от форматирования обычного вывода httpx
-  # и надёжно получить финальный URL и HTTP-код.
   "$HTTPX_BIN" \
     -l "$ALL_CANDIDATES" \
     -silent \
     -json \
-    -t "$THREADS" \
-    -o "$HTTPX_JSON" \
-    2> "$LOG_DIR/httpx_active.stderr.log" || true
-
-  # Оставляем отвечающие URL с интересующими нас кодами.
-  # В разных версиях httpx финальный адрес может называться url или input,
-  # поэтому предусмотрены оба поля.
-  "$JQ_BIN" -r --arg codes "$HTTPX_CODES" '
-    ($codes | split(",") | map(tonumber)) as $allowed
-    | select(.status_code as $s | $allowed | index($s))
-    | (.url // .input // empty)
-  ' "$HTTPX_JSON" 2>> "$LOG_DIR/httpx_active.stderr.log" \
-    | sed '/^[[:space:]]*$/d' \
-    | sort -u > "$ACTIVE_HITS" || true
-
-  log "Ответов, записанных httpx в JSONL: $(wc -l < "$HTTPX_JSON" | tr -d ' ')"
-  HTTPX_404_COUNT="$($JQ_BIN -r 'select(.status_code == 404) | .url // .input // empty' "$HTTPX_JSON" 2>/dev/null | wc -l | tr -d ' ')"
-  if (( HTTPX_404_COUNT > 0 )); then
-    log "Из них 404 (не считаются найденными endpoint'ами): $HTTPX_404_COUNT"
-  fi
-  if [[ ! -s "$HTTPX_JSON" ]]; then
-    warn "httpx не вернул ни одного JSONL-ответа для кандидатов. Проверьте logs/httpx_active.stderr.log"
-  fi
-else
-  warn "Нет кандидатов для httpx: $ALL_CANDIDATES пуст."
-fi
-
-# Категории строятся только после формирования общего списка живых URL.
-grep -iE 'auth|login|signin|token|oauth|openid|swagger|openapi|redoc|api-docs|docs|internal|debug|actuator|mail|webmail|roundcube|owa|autodiscover|admin|dashboard|phpmyadmin|graphql|metrics|monitor|server-status|server-info|backup|health|status' "$ACTIVE_HITS" \
-  | sort -u > "$PRIORITY_HITS" || true
-grep -iE 'auth|login|signin|token|oauth|openid|account' "$ACTIVE_HITS" \
-  | sort -u > "$AUTH_HITS" || true
-grep -iE 'swagger|openapi|redoc|api-docs|docs' "$ACTIVE_HITS" \
-  | sort -u > "$API_DOC_HITS" || true
-grep -iE 'internal|debug|actuator|health|monitor|metrics|server-status|server-info|backup' "$ACTIVE_HITS" \
-  | sort -u > "$INTERNAL_HITS" || true
-
-run_httpx_details() {
-  local input="$1"
-  local output="$2"
-  [[ -s "$input" ]] || { : > "$output"; return 0; }
-  "$HTTPX_BIN" \
-    -l "$input" \
-    -silent \
-    -mc "$HTTPX_CODES" \
+    -follow-redirects \
     -title \
     -content-length \
     -tech-detect \
     -t "$THREADS" \
-    -o "$output" \
-    2>> "$LOG_DIR/httpx_details.stderr.log" || true
-}
+    -o "$HTTPX_JSON" \
+    2> "$LOG_DIR/httpx_urls.stderr.log" || true
 
-run_httpx_details "$AUTH_HITS" "$CAND_DIR/auth_details.txt"
-run_httpx_details "$API_DOC_HITS" "$CAND_DIR/api_docs_details.txt"
-run_httpx_details "$INTERNAL_HITS" "$CAND_DIR/internal_details.txt"
+  "$JQ_BIN" -r --arg codes "$HTTPX_CODES" '
+    ($codes | split(",") | map(tonumber)) as $allowed
+    | select(.status_code as $s | $allowed | index($s))
+    | (.url // .input // empty)
+  ' "$HTTPX_JSON" 2>> "$LOG_DIR/httpx_urls.stderr.log" |
+    sed '/^[[:space:]]*$/d' |
+    sort -u > "$ACTIVE_HITS" || true
+fi
 
-log "Активных URL после httpx: $(wc -l < "$ACTIVE_HITS" | tr -d ' ')"
+log "Ответов httpx: $(wc -l < "$HTTPX_JSON" | tr -d ' ')"
+log "Активных интересных URL: $(wc -l < "$ACTIVE_HITS" | tr -d ' ')"
 
-log "5/6: Скачивание открытых Swagger/OpenAPI-спецификаций..."
+###############################################################################
+# CATEGORIES
+###############################################################################
+
+grep -iE \
+'auth|login|signin|token|oauth|openid|swagger|openapi|redoc|api-docs|docs|internal|debug|actuator|mail|webmail|roundcube|owa|autodiscover|admin|administrator|dashboard|panel|portal|phpmyadmin|adminer|graphql|metrics|monitor|grafana|server-status|server-info|backup|health|status' \
+  "$ACTIVE_HITS" |
+  sort -u > "$PRIORITY_HITS" || true
+
+grep -iE \
+'auth|login|signin|token|oauth|openid|account' \
+  "$ACTIVE_HITS" |
+  sort -u > "$AUTH_HITS" || true
+
+grep -iE \
+'swagger|openapi|redoc|api-docs|docs' \
+  "$ACTIVE_HITS" |
+  sort -u > "$API_DOC_HITS" || true
+
+grep -iE \
+'mail|webmail|roundcube|roundcubemail|rainloop|squirrelmail|owa|exchange|autodiscover|autoconfig' \
+  "$ACTIVE_HITS" |
+  sort -u > "$MAIL_HITS" || true
+
+grep -iE \
+'admin|administrator|dashboard|panel|controlpanel|manage|manager|management|console|portal|phpmyadmin|adminer' \
+  "$ACTIVE_HITS" |
+  sort -u > "$ADMIN_HITS" || true
+
+grep -iE \
+'internal|debug|actuator|health|monitor|metrics|grafana|server-status|server-info|diagnostic' \
+  "$ACTIVE_HITS" |
+  sort -u > "$INTERNAL_HITS" || true
+
+grep -iE \
+'backup|backups|archive|archives|dump|upload|uploads|download|downloads|files' \
+  "$ACTIVE_HITS" |
+  sort -u > "$FILES_HITS" || true
+
+###############################################################################
+# 7/8 SWAGGER/OPENAPI DOWNLOAD
+###############################################################################
+
+log "7/8: Скачивание открытых Swagger/OpenAPI-спецификаций..."
+
+downloaded=0
+
 if [[ "$DOWNLOAD_SPECS" -eq 1 && -s "$API_DOC_HITS" ]]; then
   curl_tls=()
+
   [[ "$INSECURE" -eq 1 ]] && curl_tls=(-k)
-  downloaded=0
 
   while IFS= read -r url; do
     [[ -n "$url" ]] || continue
-    [[ "$url" =~ (swagger\.(json|ya?ml)|openapi\.(json|ya?ml)|/v[0-9]+/api-docs|/api-docs)(/|$|\?) ]] || continue
-    (( downloaded >= 50 )) && { warn "Достигнут лимит 50 спецификаций."; break; }
+
+    [[ "$url" =~ (swagger\.(json|ya?ml)|openapi\.(json|ya?ml)|/v[0-9]+/api-docs|/api-docs)(/|$|\?) ]] ||
+      continue
+
+    (( downloaded >= 50 )) && {
+      warn "Достигнут лимит 50 спецификаций."
+      break
+    }
 
     hash="$(printf '%s' "$url" | sha256sum | awk '{print substr($1,1,16)}')"
     name="$(safe_filename "${url#*://}")"
     name="${name:0:120}"
+
     [[ -n "$name" ]] || name="spec"
 
     if [[ "$url" =~ ya?ml ]]; then
@@ -520,50 +788,84 @@ if [[ "$DOWNLOAD_SPECS" -eq 1 && -s "$API_DOC_HITS" ]]; then
       ext="json"
     fi
 
-    if "$CURL_BIN" "${curl_tls[@]}" -fsSL \
+    if "$CURL_BIN" \
+      "${curl_tls[@]}" \
+      -fsSL \
       --connect-timeout 5 \
       --max-time 20 \
       -H 'Accept: application/json, application/yaml, text/yaml, */*' \
       -D "$SPECS_DIR/${name}_${hash}.headers.txt" \
       "$url" \
       -o "$SPECS_DIR/${name}_${hash}.${ext}"; then
-      printf '%s\t%s\n' "$url" "$SPECS_DIR/${name}_${hash}.${ext}" >> "$SPECS_DIR/downloaded.tsv"
+
+      printf '%s\t%s\n' \
+        "$url" \
+        "$SPECS_DIR/${name}_${hash}.${ext}" \
+        >> "$SPECS_DIR/downloaded.tsv"
+
       ((downloaded += 1))
     else
-      rm -f "$SPECS_DIR/${name}_${hash}.headers.txt" "$SPECS_DIR/${name}_${hash}.${ext}"
+      rm -f \
+        "$SPECS_DIR/${name}_${hash}.headers.txt" \
+        "$SPECS_DIR/${name}_${hash}.${ext}"
     fi
+
     sleep 0.2
   done < "$API_DOC_HITS"
-else
-  downloaded=0
 fi
 
-log "6/6: Формирование сводки..."
+###############################################################################
+# 8/8 SUMMARY
+###############################################################################
+
+log "8/8: Формирование сводки..."
+
 {
-  printf 'API recon summary\n'
-  printf '=================\n'
+  printf 'Web/API recon summary\n'
+  printf '=====================\n'
   printf 'Domain: %s\n' "$DOMAIN"
-  printf 'Started/finished: %s\n' "$(date --iso-8601=seconds)"
+  printf 'Finished: %s\n' "$(date --iso-8601=seconds)"
   printf 'Output directory: %s\n' "$OUTPUT_DIR"
-  printf 'Hosts actively checked: %s\n' "$(wc -l < "$HOSTS_FILE" | tr -d ' ')"
+
+  printf '\nSubdomains\n'
+  printf '----------\n'
+  printf 'Subfinder: %s\n' "$(wc -l < "$SUBFINDER_FILE" | tr -d ' ')"
+  printf 'From gau URLs: %s\n' "$(wc -l < "$GAU_SUBDOMAINS" | tr -d ' ')"
+  printf 'User supplied: %s\n' "$(wc -l < "$USER_SUBDOMAINS" | tr -d ' ')"
+  printf 'All unique hosts: %s\n' "$(wc -l < "$ALL_SUBDOMAINS" | tr -d ' ')"
+  printf 'Live web hosts: %s\n' "$(wc -l < "$LIVE_HOSTS" | tr -d ' ')"
+
+  printf '\nURLs\n'
+  printf '----\n'
   printf 'Historical URLs: %s\n' "$(wc -l < "$ALL_URLS" | tr -d ' ')"
-  printf 'Historical API candidates: %s\n' "$(wc -l < "$API_CANDIDATES" | tr -d ' ')"
+  printf 'Interesting historical URLs: %s\n' "$(wc -l < "$INTERESTING_HIST" | tr -d ' ')"
   printf 'Unique ffuf hits: %s\n' "$(wc -l < "$FFUF_HITS" | tr -d ' ')"
-  printf 'All candidates (historical + ffuf): %s\n' "$(wc -l < "$ALL_CANDIDATES" | tr -d ' ')"
-  printf 'Active httpx hits: %s\n' "$(wc -l < "$ACTIVE_HITS" | tr -d ' ')"
-  printf 'Auth/login/token candidates: %s\n' "$(wc -l < "$AUTH_HITS" | tr -d ' ')"
-  printf 'Swagger/OpenAPI/docs candidates: %s\n' "$(wc -l < "$API_DOC_HITS" | tr -d ' ')"
-  printf 'Internal/debug candidates: %s\n' "$(wc -l < "$INTERNAL_HITS" | tr -d ' ')"
-  printf 'Downloaded specifications: %s\n' "${downloaded:-0}"
-  printf '\nImportant files:\n'
-  printf '  %s\n' "$ALL_URLS"
-  printf '  %s\n' "$API_CANDIDATES"
-  printf '  %s\n' "$ALL_CANDIDATES"
-  printf '  %s\n' "$HTTPX_JSON"
-  printf '  %s\n' "$ACTIVE_HITS"
-  printf '  %s\n' "$PRIORITY_HITS"
-  printf '  %s\n' "$CAND_DIR/api_docs_details.txt"
+  printf 'All candidates: %s\n' "$(wc -l < "$ALL_CANDIDATES" | tr -d ' ')"
+  printf 'Active interesting URLs: %s\n' "$(wc -l < "$ACTIVE_HITS" | tr -d ' ')"
+
+  printf '\nCategories\n'
+  printf '----------\n'
+  printf 'Priority: %s\n' "$(wc -l < "$PRIORITY_HITS" | tr -d ' ')"
+  printf 'Auth/login/token: %s\n' "$(wc -l < "$AUTH_HITS" | tr -d ' ')"
+  printf 'Swagger/OpenAPI/docs: %s\n' "$(wc -l < "$API_DOC_HITS" | tr -d ' ')"
+  printf 'Mail/webmail: %s\n' "$(wc -l < "$MAIL_HITS" | tr -d ' ')"
+  printf 'Admin/panels: %s\n' "$(wc -l < "$ADMIN_HITS" | tr -d ' ')"
+  printf 'Internal/debug/monitoring: %s\n' "$(wc -l < "$INTERNAL_HITS" | tr -d ' ')"
+  printf 'Files/backups: %s\n' "$(wc -l < "$FILES_HITS" | tr -d ' ')"
+  printf 'Downloaded specifications: %s\n' "$downloaded"
+
+  printf '\nImportant files\n'
+  printf '---------------\n'
+  printf '%s\n' "$ALL_SUBDOMAINS"
+  printf '%s\n' "$LIVE_HOSTS"
+  printf '%s\n' "$ALL_URLS"
+  printf '%s\n' "$INTERESTING_HIST"
+  printf '%s\n' "$ACTIVE_HITS"
+  printf '%s\n' "$PRIORITY_HITS"
+  printf '%s\n' "$HTTPX_JSON"
+  printf '%s\n' "$RUN_LOG"
 } > "$SUMMARY"
 
-log "Готово. Сводка: $SUMMARY"
-log "Скрипт завершает работу на этапе разведки и получения публичных спецификаций."
+log "Готово."
+log "Сводка: $SUMMARY"
+log "Все логи: $LOG_DIR"
