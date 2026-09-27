@@ -50,6 +50,59 @@ EOF
 log()  { printf '[+] %s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*" >&2; }
 debug() { if [[ "$DEBUG" -eq 1 ]]; then printf '[DEBUG] %s\n' "$*" >&2; fi; }
+run_logged_command() {
+  local label="$1"
+  local output_file="${2:-}"
+  shift 2
+
+  local stdout_log="$LOG_DIR/${label}.stdout.log"
+  local stderr_log="$LOG_DIR/${label}.stderr.log"
+  : > "$stdout_log"
+  : > "$stderr_log"
+
+  if [[ "$DEBUG" -eq 1 ]]; then
+    log "[$label] запуск..."
+  fi
+
+  if [[ -n "$output_file" ]]; then
+    if "$@" > "$stdout_log" 2> "$stderr_log" && [[ -n "$output_file" ]]; then
+      if [[ -s "$stdout_log" ]]; then
+        cat "$stdout_log" > "$output_file"
+      else
+        warn "[$label] завершилась успешно, но ничего не вывела в stdout. Ожидался результат: $output_file"
+        : > "$output_file"
+      fi
+      if [[ "$DEBUG" -eq 1 ]]; then
+        log "[$label] завершена. Лог: $stdout_log | $stderr_log"
+      fi
+      return 0
+    else
+      local rc=$?
+      warn "[$label] завершилась с кодом $rc. Логи: $stdout_log, $stderr_log"
+      if [[ ! -s "$stdout_log" && ! -s "$stderr_log" ]]; then
+        warn "[$label] ничего не вывела в stdout/stderr."
+      fi
+      return $rc
+    fi
+  fi
+
+  if "$@" > "$stdout_log" 2> "$stderr_log"; then
+    if [[ ! -s "$stdout_log" && ! -s "$stderr_log" ]]; then
+      warn "[$label] завершилась успешно, но ничего не вывела в stdout/stderr."
+    fi
+    if [[ "$DEBUG" -eq 1 ]]; then
+      log "[$label] завершена. Лог: $stdout_log | $stderr_log"
+    fi
+    return 0
+  else
+    local rc=$?
+    warn "[$label] завершилась с кодом $rc. Логи: $stdout_log, $stderr_log"
+    if [[ ! -s "$stdout_log" && ! -s "$stderr_log" ]]; then
+      warn "[$label] ничего не вывела в stdout/stderr."
+    fi
+    return $rc
+  fi
+}
 die()  { printf '[-] %s\n' "$*" >&2; exit 1; }
 
 cleanup_domain() {
@@ -232,107 +285,12 @@ AUTH_HITS="$CAND_DIR/auth_login_token.txt"
 API_DOC_HITS="$CAND_DIR/swagger_openapi_docs.txt"
 INTERNAL_HITS="$CAND_DIR/internal_debug.txt"
 SUMMARY="$OUTPUT_DIR/summary.txt"
+WORDLIST_SOURCE="$(cd "$(dirname "$0")" && pwd)/wordlist.txt"
 
-cat > "$WORDLIST" <<'EOF'
-swagger.json
-swagger.yaml
-openapi.json
-openapi.yaml
-v2/api-docs
-api-docs
-swagger-ui
-swagger-ui.html
-swagger-ui/index.html
-docs
-redoc
-api
-v1
-v2
-v3
-auth
-login
-token
-oauth
-openid
-admin/api
-internal-api
-internal
-debug
-health
-healthz
-status
-actuator
-actuator/health
-mail
-email
-smtp
-support
-contact
-help
-register
-signup
-login
-password
-reset
-recover
-forgot
-account
-profile
-users
-me
-dashboard
-admin
-portal
-app
-web
-wp-json
-well-known
-.well-known
-sso
-oauth2
-oidc
-config
-settings
-backup
-backup.zip
-cms
-site
-public
-private
-internal
-console
-manager
-monitoring
-metrics
-actuator/prometheus
-grafana
-kibana
-log
-logs
-admin/login
-admin/api
-app/api
-api/v1
-api/v2
-api/v3
-v1/users
-v2/users
-v3/users
-auth/login
-auth/token
-oauth/token
-openid/connect
-api-docs
-graphql
-graphiql
-tenant
-tenants
-tenant-admin
-mail/admin
-mail/login
-mail/api
-mail/.well-known
-EOF
+if [[ ! -r "$WORDLIST_SOURCE" ]]; then
+  die "Не найден файл словаря: $WORDLIST_SOURCE"
+fi
+cp "$WORDLIST_SOURCE" "$WORDLIST"
 
 # Главный домен всегда входит в активную область.
 printf '%s\n' "$DOMAIN" > "$HOSTS_FILE"
@@ -359,7 +317,11 @@ log "Каталог результатов: $OUTPUT_DIR"
 
 log "1/6: Сбор исторических URL через gau..."
 # --subs повторяет логику статьи и включает исторические URL субдоменов.
-"$GAU_BIN" "$DOMAIN" --subs > "$GAU_FILE" 2> "$LOG_DIR/gau.stderr.log" || warn "gau завершился с ошибкой; смотрите logs/gau.stderr.log"
+if run_logged_command "gau" "$GAU_FILE" "$GAU_BIN" "$DOMAIN" --subs; then
+  :
+else
+  warn "gau завершился с ошибкой; смотрите logs/gau.stdout.log и logs/gau.stderr.log"
+fi
 
 log "2/6: Сбор URL через Wayback Machine..."
 debug "Запуск waybackurls для $DOMAIN. Таймаут: ${WAYBACK_TIMEOUT}s."
@@ -375,6 +337,9 @@ else
 fi
 wayback_end=$(date +%s)
 debug "Wayback завершён за $((wayback_end - wayback_start))s. Размер файла: $(wc -l < "$WAYBACK_FILE" | tr -d ' ') строк."
+if [[ ! -s "$WAYBACK_FILE" ]]; then
+  warn "Wayback Machine ничего не вернул для $DOMAIN. Проверьте logs/waybackurls.stderr.log"
+fi
 
 cat "$GAU_FILE" "$WAYBACK_FILE" 2>/dev/null | sed '/^[[:space:]]*$/d' | sort -u > "$ALL_URLS"
 debug "После объединения исторических URL записано $(wc -l < "$ALL_URLS" | tr -d ' ') строк."
@@ -490,18 +455,25 @@ if [[ -s "$ALL_CANDIDATES" ]]; then
     | sort -u > "$ACTIVE_HITS" || true
 
   log "Ответов, записанных httpx в JSONL: $(wc -l < "$HTTPX_JSON" | tr -d ' ')"
+  HTTPX_404_COUNT="$($JQ_BIN -r 'select(.status_code == 404) | .url // .input // empty' "$HTTPX_JSON" 2>/dev/null | wc -l | tr -d ' ')"
+  if (( HTTPX_404_COUNT > 0 )); then
+    log "Из них 404 (не считаются найденными endpoint'ами): $HTTPX_404_COUNT"
+  fi
+  if [[ ! -s "$HTTPX_JSON" ]]; then
+    warn "httpx не вернул ни одного JSONL-ответа для кандидатов. Проверьте logs/httpx_active.stderr.log"
+  fi
 else
   warn "Нет кандидатов для httpx: $ALL_CANDIDATES пуст."
 fi
 
 # Категории строятся только после формирования общего списка живых URL.
-grep -iE 'auth|login|token|oauth|openid|swagger|openapi|redoc|api-docs|docs|internal|debug|actuator' "$ACTIVE_HITS" \
+grep -iE 'auth|login|signin|token|oauth|openid|swagger|openapi|redoc|api-docs|docs|internal|debug|actuator|mail|webmail|roundcube|owa|autodiscover|admin|dashboard|phpmyadmin|graphql|metrics|monitor|server-status|server-info|backup|health|status' "$ACTIVE_HITS" \
   | sort -u > "$PRIORITY_HITS" || true
-grep -iE 'auth|login|token|oauth|openid' "$ACTIVE_HITS" \
+grep -iE 'auth|login|signin|token|oauth|openid|account' "$ACTIVE_HITS" \
   | sort -u > "$AUTH_HITS" || true
 grep -iE 'swagger|openapi|redoc|api-docs|docs' "$ACTIVE_HITS" \
   | sort -u > "$API_DOC_HITS" || true
-grep -iE 'internal|debug|actuator' "$ACTIVE_HITS" \
+grep -iE 'internal|debug|actuator|health|monitor|metrics|server-status|server-info|backup' "$ACTIVE_HITS" \
   | sort -u > "$INTERNAL_HITS" || true
 
 run_httpx_details() {
